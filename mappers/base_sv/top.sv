@@ -42,12 +42,24 @@ module top(
 );
 
 
-	assign exp_io[0] 		= 1'bz;
-	assign exp_io[9:1] 	= 9'hzz;
+	assign exp_io[0] = 1'bz;
+	assign exp_io[2] = 1'bz;
+	assign exp_io[5] = 1'bz;
+	assign exp_io[6] = 1'bz;
+	assign exp_io[7] = 1'bz;
+	assign exp_io[9] = 1'bz;
 	assign xio[2:0] 		= 3'bzzz;
 	assign boot_on 		= 0;
 	assign m2n				= !m2;
-	
+
+	//----------------------------------------------------
+	// EPSM Addressing
+	//----------------------------------------------------  
+    assign exp_io[1] = !(!cpu_rw & prg_ce & cpu_addr[14] & cpu_addr[13:2]==3'b00000000111);                // $401c-$401f
+    assign exp_io[3] = 0; 
+    assign exp_io[4] = prg_addr[1];
+    assign exp_io[7] = prg_addr[0];
+    assign exp_io[8] = m2;
 
 	SysCfg cfg;
 	DmaBus dma;
@@ -105,7 +117,8 @@ module top(
 	assign srm_oe 				= !srm.oe;
 	assign srm_we 				= !(srm.we & (we_ok | srm.async_io));
 	
-	assign cpu_irq				= !mao.irq;
+	assign cpu_irq				= !mao.irq & epsm_irq;
+	//assign cpu_irq				= epsm_irq;
 	
 	assign led 					= mao.led | (mai.sys_rst & mai.map_rst & cfg.map_idx != 255);//ss_act
 	
@@ -346,6 +359,17 @@ module top(
 	);
 `endif
 //****************************************************************************************
+	wire epsm_irq;
+    epsmirqs epsmirqs_inst(
+        .ext_CPU_ADDR(cpu_addr),
+        .CPU_DATA(cpu_dat),
+        .CPU_ROMSEL(cpu_ce),
+        .CPU_RW(cpu_rw),
+        .M2(cpu.m2),
+        .clk(mai.clk),
+        .CPU_IRQ(epsm_irq),
+    );
+
 endmodule
 
 //*********************************************************************************
@@ -545,3 +569,106 @@ module dac_ds(
 	end
 	
 endmodule 
+
+//********************************************************************************* epsm IRQ
+
+module epsmirqs
+  (
+   input [14:0] ext_CPU_ADDR,
+   input [7:0]  CPU_DATA,
+   input        CPU_ROMSEL,
+   input        CPU_RW, M2,
+   input        clk, 
+   output       CPU_IRQ
+   );
+
+   reg [9:0]    TimerA_prescaler;
+   reg [3:0]    TimerB_prescaler;
+   reg [9:0]    TimerA;
+   reg [7:0]    TimerB;
+   reg [9:0]    TimerAperiod;
+   reg [7:0]    TimerBperiod;
+   reg [7:0]    EPSM_ADDR;
+   reg TimerAIrqUnmask, TimerBIrqUnmask,
+       TimerAIrqPermit, TimerBIrqPermit,
+       TimerAEnable, TimerBEnable;
+   reg TimerAIrq, TimerBIrq;
+   reg TimerAIrqReqL, TimerAIrqReqR, // for crossing clock domains
+       TimerBIrqReqL, TimerBIrqReqR;
+
+   wire [16:0] CPU_ADDR;
+   
+   assign CPU_ADDR = {CPU_RW, !CPU_ROMSEL, ext_CPU_ADDR};
+
+   assign CPU_IRQ = !(TimerAIrq & TimerAIrqUnmask) &
+	 !(TimerBIrq & TimerBIrqUnmask);
+   
+   always @(negedge M2) begin
+      if (CPU_ADDR == 17'h0401C ||
+          CPU_ADDR == 17'h0401E) begin
+         EPSM_ADDR <= CPU_DATA;
+      end else if (CPU_ADDR == 17'h0401D) begin
+         case (EPSM_ADDR)
+           8'h24: TimerAperiod[9:2] <= CPU_DATA;
+           8'h25: TimerAperiod[1:0] <= CPU_DATA[1:0];
+           8'h26: TimerBperiod <= CPU_DATA;
+           8'h29:
+             { TimerBIrqUnmask,
+               TimerAIrqUnmask } <= CPU_DATA[1:0];
+           8'h27:
+              { TimerBIrqPermit,
+                TimerAIrqPermit,
+                TimerBEnable,
+                TimerAEnable } <= CPU_DATA[3:0];
+         endcase // case (EPSM_ADDR)
+      end // if (CPU_ADDR == 17'h0401D)
+   end // always @ (negedge M2)
+
+   always @(negedge M2) begin
+      if (TimerAIrqReqL != TimerAIrqReqR) begin 
+         TimerAIrq <= 1;
+         TimerAIrqReqR <= TimerAIrqReqL;
+      end else if (CPU_ADDR == 17'h0401D && EPSM_ADDR == 8'h27) begin
+         if (CPU_DATA[4] == 1)
+           TimerAIrq <= 0;
+      end
+      if (TimerBIrqReqL != TimerBIrqReqR) begin 
+         TimerBIrq <= 1;
+         TimerBIrqReqR <= TimerBIrqReqL;
+      end else if (CPU_ADDR == 17'h0401D && EPSM_ADDR == 8'h27) begin
+         if (CPU_DATA[5] == 1)
+           TimerBIrq <= 0;
+      end
+   end // always @ (negedge M2)
+
+   // clk is the 50MHz clock source on the EDN8Pro
+   always @(posedge clk) begin
+      if (TimerA_prescaler == 10'd0) begin
+        TimerA_prescaler <= 1024-900; // 450 = 50MHz / 8MHz * 72
+
+         if (TimerAEnable) begin
+           if (TimerA == 10'd0) begin
+              TimerA <= TimerAperiod;
+           end else if (TimerA == 10'h3FF) begin
+              if (TimerAIrqPermit) TimerAIrqReqL <= !TimerAIrqReqL;
+              TimerA <= 10'd0;
+           end else TimerA <= TimerA + 1;
+         end else TimerA <= 0;
+
+         TimerB_prescaler <= TimerB_prescaler + 1; // 16
+
+         if (TimerB_prescaler == 4'd0) begin 
+            if (TimerBEnable) begin
+               if (TimerB == 8'd0) begin
+                  TimerB <= TimerBperiod;
+               end else if (TimerB == 8'hFF) begin
+                  if (TimerBIrqPermit) TimerBIrqReqL <= !TimerBIrqReqL;
+                  TimerB <= 8'd0;
+               end else TimerB <= TimerB + 1;
+            end else TimerB <= 0;
+         end
+
+      end else TimerA_prescaler <= TimerA_prescaler + 1;
+   end
+
+endmodule // epsmirqs
